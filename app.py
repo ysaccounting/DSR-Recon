@@ -1,0 +1,907 @@
+"""
+QBO ↔ TicketVault Reconciliation — backend.
+
+Two-way reconciliation between, for each entity:
+
+  1. QuickBooks "Profit and Loss Detail"  — the accounting book. Income → Sales carries
+     one Invoice line per marketplace per day (Name = "Stubhub (C)", "Vivid Seats (C)", …).
+     Cost of Goods Sold carries one Journal Entry per day (a daily aggregate — no
+     marketplace breakdown). A "Foreign Exchange Conversion" income sub-account, if
+     present, is excluded entirely (its lines are never read).
+  2. TicketVault export (CSV/XLSX)         — the operational book. Repeating daily blocks:
+     a day row ("-> 07/01/2026") followed by per-client rows (TicketsNow, Vivid Seats,
+     StubHub, …). The Sales "Net" column (Sold − Cancelled) is the sales figure; the Cost
+     "Net" column is the cost figure.
+
+Batch: upload any number of QBO files and any number of TicketVault files. Each QBO is
+paired to its TicketVault by entity (from filename / alias table), then period, then by
+total-sales proximity. The pairing is shown on the Summary tab.
+
+Reconciliation, flagging any difference over a tolerance ($0.01 default):
+
+  * SALES — per entity × marketplace × day. QBO's per-marketplace Invoice amount equals
+            TicketVault's Sales-Net for that marketplace/day. Divergences are flagged;
+            a marketplace present in only one book (non-zero) is flagged too.
+  * COST  — per entity × day. QBO's daily COGS journal equals TicketVault's total Cost-Net
+            for the day. (QBO has no per-marketplace cost, so cost is a day-level check.)
+
+Output is lean: a Summary tab plus Sales Discrepancies and Cost Discrepancies tabs that
+list only the flagged rows. Neither book is treated as the source of truth — both values
+are shown side by side.
+"""
+
+import io
+import os
+import re
+import csv
+import time
+import uuid
+import shutil
+import tempfile
+import datetime as dt
+from collections import defaultdict
+
+from flask import Flask, request, jsonify, send_file, send_from_directory, abort
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+app = Flask(__name__, static_folder=None)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STORE_DIR = os.path.join(tempfile.gettempdir(), "qbo_tv_recon_store")
+os.makedirs(STORE_DIR, exist_ok=True)
+
+
+# =========================================================================== #
+# RECONCILIATION CONFIG — edit these to tune matching
+# =========================================================================== #
+
+# Amounts within this many dollars are treated as equal (sub-penny never flagged).
+TOLERANCE = 0.01
+
+# Force differently-spelled marketplace names to be treated as one. Key = variant as it
+# appears in either book (normalized: "(C)"/"(CAD)" stripped, lower-cased); value = the
+# canonical display name. Only needed when a marketplace is labeled differently in QBO vs
+# TicketVault; the common names already match once "(C)" is stripped.
+MARKETPLACE_ALIASES = {
+    # "stub hub": "StubHub",
+}
+
+# TicketVault client rows that are NOT QBO Sales marketplaces (internal transfers,
+# expiries, etc.). Their COST still counts toward the day's cost total (QBO's daily COGS
+# includes them), but they are not flagged as "missing" on the SALES side. Normalized,
+# case-insensitive.
+NON_MARKETPLACE_CLIENTS = {
+    "baseball transfers",
+    "expired",
+    "transfers - yankees",
+    "transfers",
+}
+
+# Map a QBO entity name or a TicketVault filename token to a canonical entity, so the two
+# files pair up. Key = variant (normalized); value = canonical entity name. Matching is
+# exact → suffix-tolerant (LLC/Inc/…) → this table. Add an entry whenever the Summary tab
+# shows a file as unpaired.
+ENTITY_ALIASES = {
+    # "ys levine tickets": "YS Levine LLC",
+}
+
+
+# =========================================================================== #
+# Generic helpers  (reused from the ledger-reconciliation scaffold)
+# =========================================================================== #
+
+_NUM_FORMULA = re.compile(r"-?\d+(\.\d+)?")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _cleanup_old(max_age_seconds=12 * 3600):
+    now = time.time()
+    for name in os.listdir(STORE_DIR):
+        path = os.path.join(STORE_DIR, name)
+        try:
+            if os.path.isdir(path) and now - os.path.getmtime(path) > max_age_seconds:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _amount(v):
+    """Coerce a cell to float. Handles numbers, '=123.45' literals, '$1,234.56',
+    '(123)' negatives, stray whitespace. Cell-ref formulas (=B6+C6) -> None."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if s in ("", " "):
+        return None
+    if s.startswith("="):
+        body = s[1:]
+        return float(body) if _NUM_FORMULA.fullmatch(body) else None
+    neg = s.startswith("(") and s.endswith(")")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s in ("", "-", "."):
+        return None
+    try:
+        f = float(s)
+        return -f if neg else f
+    except ValueError:
+        return None
+
+
+def _norm_date(x):
+    """Normalize any date-ish cell to a datetime.date."""
+    if isinstance(x, dt.datetime):
+        return x.date()
+    if isinstance(x, dt.date):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        m = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", s)   # e.g. " -> 07/01/2026"
+        if m:
+            s = m.group(1)
+        for f in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y", "%B %d, %Y", "%b %d, %Y"):
+            try:
+                return dt.datetime.strptime(s, f).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _norm_name(s):
+    return re.sub(r"\s+", " ", str(s).strip()).lower() if s is not None else ""
+
+
+def _norm_marketplace(s):
+    """Display name for a marketplace cell, with the QBO customer/CAD markers removed."""
+    if s is None:
+        return "(unlabeled)"
+    t = str(s).strip()
+    t = re.sub(r"\((?:C|c|CAD|cad)\)", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t if t else "(unlabeled)"
+
+
+def _mkt_key(raw):
+    """(casefold key, display) for a marketplace — case-insensitive grouping with alias."""
+    disp = _norm_marketplace(raw)
+    key = disp.casefold()
+    if key in MARKETPLACE_ALIASES:
+        disp = MARKETPLACE_ALIASES[key]
+        key = disp.casefold()
+    return key, disp
+
+
+def _rows_from_upload(filename, data):
+    """Return list-of-lists of cell values from a .csv/.xlsx/.xlsm upload,
+    picking the most-populated worksheet."""
+    low = filename.lower()
+    if low.endswith(".csv"):
+        text = data.decode("utf-8-sig", errors="replace")
+        return [list(r) for r in csv.reader(io.StringIO(text))]
+    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    best, best_score = None, -1
+    for ws in wb.worksheets:
+        score = (ws.max_row or 0) * (ws.max_column or 1)
+        if score > best_score:
+            best, best_score = ws, score
+    rows = [list(r) for r in best.iter_rows(values_only=True)]
+    wb.close()
+    return rows
+
+
+def _rows_with_indent(filename, data):
+    """Like _rows_from_upload but bakes each row's indentation (literal leading spaces +
+    Excel indent property) into the first text cell, so the QBO account tree can be scoped
+    by depth. CSV falls back to plain rows (QBO exports keep literal leading spaces)."""
+    if filename.lower().endswith(".csv"):
+        return _rows_from_upload(filename, data)
+    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=False)
+    best, best_score = None, -1
+    for ws in wb.worksheets:
+        score = (ws.max_row or 0) * (ws.max_column or 1)
+        if score > best_score:
+            best, best_score = ws, score
+    out = []
+    for row in best.iter_rows():
+        first_text = next((c for c in row if isinstance(c.value, str) and c.value.strip()),
+                          None)
+        vals = []
+        for c in row:
+            v = c.value
+            if c is first_text:
+                raw = str(v)
+                lead = len(raw) - len(raw.lstrip())
+                try:
+                    align = int(round(c.alignment.indent or 0))
+                except (TypeError, ValueError):
+                    align = 0
+                v = (" " * (lead + align * 3)) + raw.strip()
+            vals.append(v)
+        out.append(vals)
+    wb.close()
+    return out
+
+
+def _find_header(rows, must_have, limit=15):
+    """Return (index, header_cells_lowered_list) for the first row within `limit` rows
+    that contains all of `must_have` (lowered substrings)."""
+    want = [w.lower() for w in must_have]
+    for i, row in enumerate(rows[:limit]):
+        cells = [(_norm_name(c) if c is not None else "") for c in row]
+        if all(any(w == c or w in c for c in cells) for w in want):
+            return i, cells
+    return None, []
+
+
+def _report_period(rows):
+    """Find a 'Month D-D, YYYY' style period line in the top rows, else None."""
+    for row in rows[:6]:
+        for cell in row[:3]:
+            if isinstance(cell, str) and re.search(r"\b20\d\d\b", cell) and \
+                    any(m in cell for m in _MONTHS):
+                return cell.strip()
+    return None
+
+
+def _period_end(rows):
+    """Best-effort month-end date from a period line; else None."""
+    line = _report_period(rows)
+    if line:
+        m = re.search(r"([A-Za-z]+)\s+\d+\s*-\s*(\d+),\s*(\d{4})", line)
+        if m:
+            try:
+                return dt.datetime.strptime(f"{m.group(1)} {m.group(2)}, {m.group(3)}",
+                                            "%B %d, %Y").date()
+            except ValueError:
+                pass
+    return None
+
+
+_REPORT_TITLES = {"transaction report", "general ledger", "balance sheet",
+                  "profit and loss detail", "profit and loss", "profit & loss detail"}
+
+
+def _detect_entity(rows):
+    """First real text cell in the top rows that isn't a report title, an 'As of' line,
+    or a date/period line — i.e. the company/entity the report was run for."""
+    for row in rows[:5]:
+        for cell in row:
+            if isinstance(cell, str) and cell.strip():
+                s = cell.strip()
+                low = s.lower()
+                if low in _REPORT_TITLES or low.startswith("as of"):
+                    break
+                if _report_period([[s]]):
+                    break
+                return s
+            elif cell is not None and str(cell).strip():
+                break
+    return None
+
+
+_SUFFIX_RE = re.compile(r"\b(l\.?l\.?c\.?|inc\.?|incorporated|corp\.?|co\.?|company|ltd\.?)\b")
+
+
+def _strip_suffix(name):
+    return re.sub(r"\s+", " ", _SUFFIX_RE.sub("", _norm_name(name))).strip()
+
+
+def _canon_entity(name):
+    """Canonicalize an entity name via the alias table (else keep as given)."""
+    if not name:
+        return None
+    key = _norm_name(name)
+    if key in ENTITY_ALIASES:
+        return ENTITY_ALIASES[key]
+    skey = _strip_suffix(name)
+    for k, v in ENTITY_ALIASES.items():
+        if _strip_suffix(k) == skey and skey:
+            return v
+    return str(name).strip()
+
+
+def _entities_match(a, b):
+    """True if two entity names refer to the same entity (exact / suffix-tolerant / alias)."""
+    if not a or not b:
+        return False
+    ca, cb = _canon_entity(a), _canon_entity(b)
+    if _norm_name(ca) == _norm_name(cb):
+        return True
+    return bool(_strip_suffix(ca)) and _strip_suffix(ca) == _strip_suffix(cb)
+
+
+# =========================================================================== #
+# Parsers
+# =========================================================================== #
+
+def parse_qbo(filename, data):
+    """QuickBooks 'Profit and Loss Detail' -> per-entity book.
+
+    Returns (entity, book, meta) where book = {
+        "sales": {(mkt_key, date): amount},   # Income → Sales invoice lines
+        "cost":  {date: amount},              # Cost of Goods Sold daily journals
+        "mkt_names": {mkt_key: display},
+        "sales_total": float, "cost_total": float,
+    }
+    Foreign Exchange Conversion lines are excluded entirely.
+    """
+    rows = _rows_with_indent(filename, data)
+    hi, _ = _find_header(rows, ["date", "amount", "balance"])
+    if hi is None:
+        raise ValueError(f"QBO '{filename}': could not find a header row with "
+                         f"'Date', 'Amount' and 'Balance'.")
+    hdr = [(_norm_name(c) if c is not None else "") for c in rows[hi]]
+
+    def col(*names):
+        for n in names:
+            for j, c in enumerate(hdr):
+                if c == n or (n and n in c):
+                    return j
+        return None
+
+    c_date = col("date")
+    c_name = col("name")
+    c_amt = col("amount")
+
+    book = {"sales": defaultdict(float), "cost": defaultdict(float), "mkt_names": {}}
+    section = None            # "sales" | "cost" | None
+
+    for row in rows[hi + 1:]:
+        a = row[0] if row else None
+        if isinstance(a, str) and a.strip():
+            lab = a.strip()
+            depth = (len(a) - len(a.lstrip())) // 3
+            low = lab.lower()
+            if low.startswith("total for"):
+                section = None
+            elif low == "sales":
+                section = "sales"
+            elif low == "cost of goods sold" and depth >= 2:
+                section = "cost"
+            else:
+                # any other node / parent header — including "Foreign Exchange
+                # Conversion", which is deliberately excluded from reconciliation.
+                section = None
+            continue
+        # ---- data row (col A empty) ----
+        if section is None:
+            continue
+        amt = _amount(row[c_amt]) if c_amt is not None and c_amt < len(row) else None
+        if amt is None:
+            continue
+        d = _norm_date(row[c_date]) if c_date is not None and c_date < len(row) else None
+        if d is None:
+            continue
+        if section == "sales":
+            raw = row[c_name] if c_name is not None and c_name < len(row) else None
+            mkey, mdisp = _mkt_key(raw)
+            book["sales"][(mkey, d)] += amt
+            book["mkt_names"].setdefault(mkey, mdisp)
+        elif section == "cost":
+            book["cost"][d] += amt
+
+    entity = _canon_entity(_detect_entity(rows))
+    book["sales_total"] = round(sum(book["sales"].values()), 2)
+    book["cost_total"] = round(sum(book["cost"].values()), 2)
+    book["sales"] = dict(book["sales"])
+    book["cost"] = dict(book["cost"])
+    meta = {"period": _report_period(rows), "period_end": _period_end(rows),
+            "entity": entity, "filename": filename}
+    return entity, book, meta
+
+
+_TV_HEADER_WORDS = {"sales", "cost", "invoices", "tickets", "date", "client", "net",
+                    "sold", "cancelled", "cost of sold", "cost of cancelled",
+                    "net profit", "profit"}
+
+
+def _tv_entity(rows, hi):
+    """Look for a company/title row above the TicketVault header. A real title row has a
+    single populated cell that isn't a column-group word or a date/period line. Most
+    TicketVault exports have no such row (returns None), in which case pairing falls back
+    to the filename / period / totals."""
+    for row in rows[:hi]:
+        populated = [str(c).strip() for c in row if c is not None and str(c).strip()]
+        if len(populated) != 1:
+            continue
+        cand = populated[0]
+        low = cand.lower()
+        if low in _TV_HEADER_WORDS or not re.search(r"[A-Za-z]", cand):
+            continue
+        if _report_period([[cand]]) or _norm_date(cand):
+            continue
+        return cand
+    return None
+
+
+def parse_ticketvault(filename, data):
+    """TicketVault export -> book of the same shape as parse_qbo's (minus fx).
+
+    Day blocks: a row with text in column 0 ('-> MM/DD/YYYY') is the day header/total;
+    the following rows (blank column 0, client in column 1) are the per-client lines.
+    Sales uses the Sales-group 'Net' column (Sold − Cancelled); cost uses the Cost-group
+    'Net' column. Client cost is summed per day to match QBO's daily COGS aggregate.
+    """
+    rows = _rows_from_upload(filename, data)
+    # Header row: the one containing 'client' + 'sold' (+ 'cost of sold').
+    hi = None
+    for i, row in enumerate(rows[:12]):
+        cells = [(_norm_name(c) if c is not None else "") for c in row]
+        if "client" in cells and "sold" in cells:
+            hi = i
+            hdr = cells
+            break
+    if hi is None:
+        raise ValueError(f"TicketVault '{filename}': could not find the "
+                         f"'Date / Client / Sold …' header row.")
+
+    def idx(name):
+        return hdr.index(name) if name in hdr else None
+
+    c_date = idx("date") if idx("date") is not None else 0
+    c_client = idx("client") if idx("client") is not None else 1
+    # Two 'net' columns: sales-net after 'cancelled', cost-net after 'cost of cancelled'.
+    net_positions = [j for j, c in enumerate(hdr) if c == "net"]
+    i_cancelled = hdr.index("cancelled") if "cancelled" in hdr else 3
+    i_cost_can = hdr.index("cost of cancelled") if "cost of cancelled" in hdr else 6
+    c_sales_net = next((j for j in net_positions if j > i_cancelled), 4)
+    c_cost_net = next((j for j in net_positions if j > i_cost_can), 7)
+
+    entity = _canon_entity(_tv_entity(rows, hi))
+    book = {"sales": defaultdict(float), "cost": defaultdict(float), "mkt_names": {}}
+    cur_date = None
+    for row in rows[hi + 1:]:
+        first = row[c_date] if c_date < len(row) else None
+        if first is not None and str(first).strip():
+            cur_date = _norm_date(first)          # day header/total row — sets the date
+            continue
+        client = row[c_client] if c_client < len(row) else None
+        if client is None or not str(client).strip() or cur_date is None:
+            continue
+        sales_net = _amount(row[c_sales_net]) if c_sales_net < len(row) else None
+        cost_net = _amount(row[c_cost_net]) if c_cost_net < len(row) else None
+        mkey, mdisp = _mkt_key(client)
+        if cost_net is not None:
+            book["cost"][cur_date] += cost_net
+        if _norm_name(client) in NON_MARKETPLACE_CLIENTS:
+            continue                              # not a QBO sales marketplace
+        if sales_net is not None:
+            book["sales"][(mkey, cur_date)] += sales_net
+            book["mkt_names"].setdefault(mkey, mdisp)
+
+    all_dates = [d for (_, d) in book["sales"]] + list(book["cost"])
+    meta = {"period_end": max(all_dates) if all_dates else None,
+            "period_start": min(all_dates) if all_dates else None,
+            "period": None, "entity": entity, "filename": filename}
+    if all_dates:
+        s, e = min(all_dates), max(all_dates)
+        meta["period"] = (s.strftime("%B %-d") + "-" + e.strftime("%-d, %Y")
+                          if s.month == e.month and s.year == e.year
+                          else f"{s:%m/%d/%Y}-{e:%m/%d/%Y}")
+    book["sales_total"] = round(sum(book["sales"].values()), 2)
+    book["cost_total"] = round(sum(book["cost"].values()), 2)
+    book["sales"] = dict(book["sales"])
+    book["cost"] = dict(book["cost"])
+    return book, meta
+
+
+# =========================================================================== #
+# Pairing  (QBO file  <->  TicketVault file)
+# =========================================================================== #
+
+def _periods_overlap(a, b):
+    (a0, a1), (b0, b1) = a, b
+    if None in (a0, a1, b0, b1):
+        return False
+    return a0 <= b1 and b0 <= a1
+
+
+def _qbo_period_range(book, meta):
+    dates = [d for (_, d) in book["sales"]] + list(book["cost"])
+    if not dates:
+        return (None, None)
+    return (min(dates), max(dates))
+
+
+def pair_files(qbos, tvs):
+    """qbos: list of (entity, book, meta). tvs: list of (book, meta, entity_from_name).
+    Greedy one-to-one pairing by entity match, then period overlap, then total-sales
+    proximity. Returns (pairs, unpaired_qbo, unpaired_tv, basis) where pairs is a list of
+    (qi, ti) index tuples and basis[(qi,ti)] describes why."""
+    cand = []
+    for qi, (qent, qbook, qmeta) in enumerate(qbos):
+        qrange = _qbo_period_range(qbook, qmeta)
+        for ti, (tbook, tmeta, tent) in enumerate(tvs):
+            trange = (tmeta.get("period_start"), tmeta.get("period_end"))
+            score, why = 0, []
+            if qent and tent and _entities_match(qent, tent):
+                score += 100
+                why.append("entity")
+            if qrange == trange and None not in qrange:
+                score += 50
+                why.append("period=")
+            elif _periods_overlap(qrange, trange):
+                score += 25
+                why.append("period~")
+            sdiff = abs((qbook["sales_total"] or 0) - (tbook["sales_total"] or 0))
+            if sdiff <= TOLERANCE:
+                score += 40
+                why.append("sales=")
+            else:
+                score += max(0, 20 - min(20, sdiff / 1000.0))
+            cand.append((score, qi, ti, ", ".join(why) or "best-fit"))
+
+    cand.sort(reverse=True)
+    used_q, used_t, pairs, basis = set(), set(), [], {}
+    for score, qi, ti, why in cand:
+        if qi in used_q or ti in used_t:
+            continue
+        used_q.add(qi)
+        used_t.add(ti)
+        pairs.append((qi, ti))
+        basis[(qi, ti)] = why
+    unpaired_q = [i for i in range(len(qbos)) if i not in used_q]
+    unpaired_t = [i for i in range(len(tvs)) if i not in used_t]
+    return pairs, unpaired_q, unpaired_t, basis
+
+
+# =========================================================================== #
+# Reconciliation
+# =========================================================================== #
+
+def _eq(a, b):
+    return abs((a or 0.0) - (b or 0.0)) <= TOLERANCE
+
+
+def reconcile_pair(entity, qbook, tbook):
+    """Return (sales_rows, cost_rows) of flagged discrepancies for one entity."""
+    sales_rows, cost_rows = [], []
+
+    # ---- Sales: marketplace × day ----
+    keys = set(qbook["sales"]) | set(tbook["sales"])
+    names = {}
+    names.update(tbook.get("mkt_names", {}))
+    names.update(qbook.get("mkt_names", {}))
+    for (mkey, d) in sorted(keys, key=lambda k: (k[1], names.get(k[0], k[0]).lower())):
+        q = qbook["sales"].get((mkey, d))
+        v = tbook["sales"].get((mkey, d))
+        if _eq(q or 0.0, v or 0.0):
+            continue
+        if q is None or abs(q) <= TOLERANCE:
+            status = "TicketVault only"
+        elif v is None or abs(v) <= TOLERANCE:
+            status = "QBO only"
+        else:
+            status = "MISMATCH"
+        sales_rows.append({
+            "Entity": entity, "Date": d, "Marketplace": names.get(mkey, mkey),
+            "QBO": round(q, 2) if q is not None else 0.0,
+            "TicketVault": round(v, 2) if v is not None else 0.0,
+            "Diff (QBO-TV)": round((q or 0.0) - (v or 0.0), 2),
+            "Status": status, "_flag": True,
+        })
+
+    # ---- Cost: day level ----
+    for d in sorted(set(qbook["cost"]) | set(tbook["cost"])):
+        q = qbook["cost"].get(d)
+        v = tbook["cost"].get(d)
+        if _eq(q or 0.0, v or 0.0):
+            continue
+        if q is None or abs(q) <= TOLERANCE:
+            status = "TicketVault only"
+        elif v is None or abs(v) <= TOLERANCE:
+            status = "QBO only"
+        else:
+            status = "MISMATCH"
+        cost_rows.append({
+            "Entity": entity, "Date": d,
+            "QBO Cost": round(q, 2) if q is not None else 0.0,
+            "TicketVault Cost": round(v, 2) if v is not None else 0.0,
+            "Diff (QBO-TV)": round((q or 0.0) - (v or 0.0), 2),
+            "Status": status, "_flag": True,
+        })
+    return sales_rows, cost_rows
+
+
+# =========================================================================== #
+# Workbook builder
+# =========================================================================== #
+
+HEAD_FILL = PatternFill("solid", fgColor="374151")
+HEAD_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+FLAG_FILL = PatternFill("solid", fgColor="FDECEC")
+TITLE_FONT = Font(name="Arial", bold=True, size=13)
+SUB_FONT = Font(name="Arial", italic=True, color="6B7280", size=9)
+LABEL_FONT = Font(name="Arial", bold=True, size=10)
+BASE_FONT = Font(name="Arial", size=10)
+MONEY = '#,##0.00;(#,##0.00);"-"'
+THIN = Side(style="thin", color="E5E7EB")
+BORDER = Border(bottom=THIN)
+
+
+def _style_header(ws, row_idx, ncols):
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=row_idx, column=c)
+        cell.fill = HEAD_FILL
+        cell.font = HEAD_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def _autofit(ws, widths):
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def _emit_table(ws, start_row, columns, rows, money_cols, total_cols=None):
+    """Write a header + data table. Returns the row after the table (incl. total)."""
+    ncols = len(columns)
+    for j, name in enumerate(columns, start=1):
+        ws.cell(row=start_row, column=j, value=name)
+    _style_header(ws, start_row, ncols)
+    r = start_row + 1
+    first_data = r
+    for rec in rows:
+        flagged = rec.get("_flag")
+        for j, name in enumerate(columns, start=1):
+            v = rec.get(name, "")
+            if isinstance(v, dt.date):
+                v = v.strftime("%m/%d/%Y")
+            cell = ws.cell(row=r, column=j, value=(v if v is not None else ""))
+            cell.font = BASE_FONT
+            cell.border = BORDER
+            if name in money_cols and isinstance(rec.get(name), (int, float)):
+                cell.number_format = MONEY
+            if name in money_cols:
+                cell.alignment = Alignment(horizontal="right")
+            if flagged:
+                cell.fill = FLAG_FILL
+        r += 1
+    last_data = r - 1
+    if total_cols and last_data >= first_data:
+        ws.cell(row=r, column=1, value="TOTAL").font = LABEL_FONT
+        for name in total_cols:
+            j = columns.index(name) + 1
+            col = get_column_letter(j)
+            cell = ws.cell(row=r, column=j,
+                           value=f"=SUM({col}{first_data}:{col}{last_data})")
+            cell.font = LABEL_FONT
+            cell.number_format = MONEY
+            cell.alignment = Alignment(horizontal="right")
+        r += 1
+    return r
+
+
+def build_workbook(qbo_files, tv_files):
+    """qbo_files / tv_files: lists of (filename, bytes)."""
+    qbos, tvs, warnings = [], [], []
+
+    for fn, data in qbo_files:
+        entity, book, meta = parse_qbo(fn, data)
+        if not entity:
+            warnings.append(f"QBO '{fn}': could not detect the entity name from its "
+                            f"title row — pairing will rely on period / totals.")
+        qbos.append((entity, book, meta))
+
+    known_entities = [q[0] for q in qbos if q[0]]
+    for fn, data in tv_files:
+        book, meta = parse_ticketvault(fn, data)
+        # 1) company name read from inside the file, if any; else 2) a filename token,
+        # matched against the known QBO entities (exact / suffix / alias).
+        ent = meta.get("entity")
+        if not ent:
+            stem = os.path.splitext(os.path.basename(fn))[0].replace("_", " ")
+            for kent in known_entities:
+                if _entities_match(stem, kent):
+                    ent = kent
+                    break
+        meta["entity"] = ent
+        tvs.append((book, meta, ent))
+
+    pairs, unpaired_q, unpaired_t, basis = pair_files(qbos, tvs)
+
+    sales_rows, cost_rows, pair_info = [], [], []
+    for qi, ti in pairs:
+        qent, qbook, qmeta = qbos[qi]
+        tbook, tmeta, _ = tvs[ti]
+        entity = qent or tmeta.get("entity") or f"(entity {qi + 1})"
+        s, c = reconcile_pair(entity, qbook, tbook)
+        sales_rows.extend(s)
+        cost_rows.extend(c)
+        pair_basis = basis.get((qi, ti), "")
+        pair_info.append({
+            "Entity": entity,
+            "QBO File": qmeta["filename"],
+            "TicketVault File": tmeta["filename"],
+            "Period": qmeta.get("period") or tmeta.get("period") or "",
+            "Sales Δ": len(s), "Cost Δ": len(c),
+            "Matched On": pair_basis,
+            "_flag": bool(s or c),
+        })
+        # In a batch, a pair matched only by period/amount (no confirmed company name) is
+        # a guess — surface it so the user can verify or add an alias.
+        if (len(qbos) > 1 or len(tvs) > 1) and "entity" not in pair_basis:
+            warnings.append(
+                f"TicketVault '{tmeta['filename']}' was paired to '{entity}' by "
+                f"period/amount only — no company name was found in the file or its "
+                f"filename. Verify this pairing, or name the file with the company (or "
+                f"add an ENTITY_ALIASES entry).")
+    for qi in unpaired_q:
+        qent, _, qmeta = qbos[qi]
+        warnings.append(f"QBO '{qmeta['filename']}' (entity '{qent or 'unknown'}') had no "
+                        f"matching TicketVault export — not reconciled.")
+    for ti in unpaired_t:
+        _, tmeta, _ = tvs[ti]
+        warnings.append(f"TicketVault '{tmeta['filename']}' had no matching QBO file — "
+                        f"not reconciled.")
+
+    # sort discrepancy rows for readability
+    sales_rows.sort(key=lambda x: (x["Entity"].lower(), x["Date"], x["Marketplace"].lower()))
+    cost_rows.sort(key=lambda x: (x["Entity"].lower(), x["Date"]))
+
+    period_end = next((q[2].get("period_end") for q in qbos if q[2].get("period_end")),
+                      None) or dt.date.today()
+
+    # ------------------------------------------------------------------ workbook
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # ---- Summary ----
+    ws = wb.create_sheet("Summary")
+    ws["A1"] = "QBO ↔ TicketVault Reconciliation"
+    ws["A1"].font = TITLE_FONT
+    ws["A2"] = f"Generated {dt.datetime.now():%B %d, %Y %I:%M %p}"
+    ws["A2"].font = SUB_FONT
+    r = 4
+    facts = [
+        ("Entities reconciled", len(pairs)),
+        ("QBO files", len(qbos)),
+        ("TicketVault files", len(tvs)),
+        ("Sales discrepancies", len(sales_rows)),
+        ("Cost discrepancies", len(cost_rows)),
+        ("Unpaired files", len(unpaired_q) + len(unpaired_t)),
+        ("Tolerance", f"${TOLERANCE:.2f}"),
+    ]
+    for label, val in facts:
+        ws.cell(row=r, column=1, value=label).font = LABEL_FONT
+        ws.cell(row=r, column=2, value=val).font = BASE_FONT
+        r += 1
+
+    r += 1
+    ws.cell(row=r, column=1, value="Pairing").font = LABEL_FONT
+    r += 1
+    pcols = ["Entity", "QBO File", "TicketVault File", "Period", "Sales Δ", "Cost Δ",
+             "Matched On"]
+    if pair_info:
+        r = _emit_table(ws, r, pcols, pair_info, money_cols=set())
+    else:
+        ws.cell(row=r, column=1, value="No files could be paired.").font = BASE_FONT
+        r += 1
+
+    if warnings:
+        r += 1
+        ws.cell(row=r, column=1, value="Notes").font = LABEL_FONT
+        r += 1
+        for w in warnings:
+            ws.cell(row=r, column=1, value="• " + w).font = BASE_FONT
+            r += 1
+
+    r += 1
+    ws.cell(row=r, column=1, value="Legend").font = LABEL_FONT
+    r += 1
+    for line in ("MISMATCH — both books have a value for the marketplace/day but they differ.",
+                 "QBO only / TicketVault only — the amount appears in one book but not the other.",
+                 "Sales are matched per marketplace × day; cost is matched per day "
+                 "(QBO records cost as a single daily journal)."):
+        ws.cell(row=r, column=1, value="• " + line).font = SUB_FONT
+        r += 1
+    _autofit(ws, [26, 30, 30, 20, 10, 10, 18])
+
+    # ---- Sales Discrepancies ----
+    ws = wb.create_sheet("Sales Discrepancies")
+    scols = ["Entity", "Date", "Marketplace", "QBO", "TicketVault", "Diff (QBO-TV)", "Status"]
+    smoney = {"QBO", "TicketVault", "Diff (QBO-TV)"}
+    if sales_rows:
+        _emit_table(ws, 1, scols, sales_rows, smoney, total_cols=["QBO", "TicketVault", "Diff (QBO-TV)"])
+        ws.freeze_panes = "A2"
+    else:
+        ws["A1"] = "No sales discrepancies — every marketplace/day reconciled within tolerance."
+        ws["A1"].font = BASE_FONT
+    _autofit(ws, [22, 12, 20, 14, 14, 15, 18])
+
+    # ---- Cost Discrepancies ----
+    ws = wb.create_sheet("Cost Discrepancies")
+    ccols = ["Entity", "Date", "QBO Cost", "TicketVault Cost", "Diff (QBO-TV)", "Status"]
+    cmoney = {"QBO Cost", "TicketVault Cost", "Diff (QBO-TV)"}
+    if cost_rows:
+        _emit_table(ws, 1, ccols, cost_rows, cmoney,
+                    total_cols=["QBO Cost", "TicketVault Cost", "Diff (QBO-TV)"])
+        ws.freeze_panes = "A2"
+    else:
+        ws["A1"] = "No cost discrepancies — every day reconciled within tolerance."
+        ws["A1"].font = BASE_FONT
+    _autofit(ws, [22, 12, 16, 18, 15, 18])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    meta = {
+        "period_month": period_end.strftime("%B %Y"),
+        "entities": len(pairs),
+        "sales_flags": len(sales_rows),
+        "cost_flags": len(cost_rows),
+        "unpaired": len(unpaired_q) + len(unpaired_t),
+        "warnings": warnings,
+    }
+    return buf.getvalue(), meta
+
+
+# =========================================================================== #
+# Routes
+# =========================================================================== #
+
+@app.route("/")
+def index():
+    return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.route("/process", methods=["POST"])
+def process():
+    qbo_files = [(f.filename, f.read())
+                 for f in request.files.getlist("qbo") if f.filename]
+    tv_files = [(f.filename, f.read())
+                for f in request.files.getlist("ticketvault") if f.filename]
+    if not qbo_files:
+        return jsonify({"error": "Please upload at least one QuickBooks P&L Detail."}), 400
+    if not tv_files:
+        return jsonify({"error": "Please upload at least one TicketVault export."}), 400
+
+    try:
+        data, meta = build_workbook(qbo_files, tv_files)
+    except Exception as exc:
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+    token = uuid.uuid4().hex
+    folder = os.path.join(STORE_DIR, token)
+    os.makedirs(folder, exist_ok=True)
+    fn = f"QBO vs TicketVault Recon {meta['period_month']}.xlsx"
+    with open(os.path.join(folder, fn), "wb") as fh:
+        fh.write(data)
+    _cleanup_old()
+
+    warnings = []
+    if meta["sales_flags"]:
+        warnings.append(f"{meta['sales_flags']} sales discrepancy row(s) flagged.")
+    if meta["cost_flags"]:
+        warnings.append(f"{meta['cost_flags']} cost discrepancy row(s) flagged.")
+    if not meta["sales_flags"] and not meta["cost_flags"]:
+        warnings.append("Everything reconciled within tolerance — no discrepancies.")
+    warnings.extend(meta["warnings"])
+
+    return jsonify({
+        "download_url": f"/download/{token}",
+        "filename": fn,
+        "entities": meta["entities"],
+        "warnings": warnings,
+    })
+
+
+@app.route("/download/<token>")
+def download(token):
+    folder = os.path.join(STORE_DIR, os.path.basename(token))
+    if not os.path.isdir(folder):
+        abort(404)
+    xlsx = [f for f in os.listdir(folder) if f.lower().endswith(".xlsx")]
+    if not xlsx:
+        abort(404)
+    pick = xlsx[0]
+    return send_file(os.path.join(folder, pick),
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     as_attachment=True, download_name=pick)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
