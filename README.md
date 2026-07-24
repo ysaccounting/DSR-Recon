@@ -47,22 +47,24 @@ GK, TL, Waxler, TTG, YourTix`), served by `/options` so it can be edited in one 
 file's pick is **pre-filled from its filename** when that matches a roster name. Whatever is
 selected is **authoritative**.
 
-Internally the app resolves each uploaded QBO file's entity to a roster company (e.g. a QBO
-titled *YS Levine LLC* resolves to **Levine**) and pairs the TicketVault file to the QBO
-with the same company. The Reconcile button stays disabled until every TicketVault file has
-a company chosen. If a pick has no matching QBO file, it's flagged in the Summary **Notes**;
-if a file is left unassigned (e.g. via the API), the app falls back to reading the company
-from the file, then the filename, then period/total proximity, and flags any such guess.
+Internally the app resolves each uploaded QBO file's entity to a roster company using the
+**master mapping list** (`Master_Mapping_List.xlsx`, bundled next to `app.py`), which maps
+each QBO company name (and TicketVault spelling) to its short name — e.g. *YS Levine LLC* →
+**Levine**, *YS TL Tickets* → **TL** (not Y&S, even though both contain "YS"). It then pairs
+the TicketVault file to the QBO with the same company. Matching is on the distinctive core
+of the name, so `LLC`/`Tickets`/etc. differences don't matter; replace the bundled file to
+update the mapping. The Reconcile button stays disabled until every TicketVault file has a
+company chosen. If a file is left unassigned (e.g. via the API), the app falls back to
+reading the company from the file, then the filename, then period/total proximity.
 
-### Output tabs (lean)
+### Output tabs
 
-- **Summary** — counts, the pairing table (which QBO ↔ which TicketVault, period, flag
-  counts, match basis), notes, and a legend.
 - **Sales Discrepancies** — only the flagged entity × marketplace × day rows: QBO,
   TicketVault, `Diff (QBO−TV)`, and a `Status`, with a live `=SUM` total.
 - **Cost Discrepancies** — only the flagged entity × day rows, same shape.
 
-If a tab has nothing to show, it says so instead of listing rows.
+If a tab has nothing to show, it says so instead of listing rows. (There is no Summary tab,
+and the page shows no notes — just the download button.)
 
 ## Tuning the match
 
@@ -72,8 +74,10 @@ Edit the config block at the top of `app.py`:
 - `COMPANIES` — the roster shown in the TicketVault drop-down (names **and order**). Served
   to the page by `/options`.
 - `COMPANY_ALIASES` — force a QBO entity onto a specific roster company when the automatic
-  token match is wrong or missing (most names, like *YS Levine LLC → Levine*, resolve on
-  their own). Add an entry if a company's QBO title doesn't contain its roster name.
+  match is wrong or missing (rarely needed — the master mapping list covers the known set).
+- `Master_Mapping_List.xlsx` — the authoritative QBO-company → short-name table, read at
+  startup. Update company names by editing this file and redeploying; `COMPANY_MAP_RAW` in
+  `app.py` is a baked-in fallback used if the file is absent.
 - `MARKETPLACE_ALIASES` — force a marketplace spelled differently across the two systems
   to be treated as one (the common names already match once `(C)` is stripped).
 - `NON_MARKETPLACE_CLIENTS` — TicketVault client rows that aren't QBO sales marketplaces
@@ -107,6 +111,7 @@ python app.py        # http://localhost:5000
 | File | Purpose |
 |------|---------|
 | `app.py` | Flask backend — parsing, pairing, reconciliation, workbook builder |
+| `Master_Mapping_List.xlsx` | QBO-company → short-name mapping (read at startup) |
 | `index.html` | Single-page upload UI (two multi-file slots) |
 | `requirements.txt` | Python dependencies |
 | `Procfile` / `railway.json` | Start command for Railway |

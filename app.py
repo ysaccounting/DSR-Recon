@@ -100,6 +100,26 @@ COMPANY_ALIASES = {
     # "some holdings llc": "TTG",
 }
 
+# Authoritative name mapping from Master_Mapping_List.xlsx (QBO Company -> Short Name). The
+# bundled Master_Mapping_List.xlsx, if present next to app.py, is read at startup and
+# overrides/extends this — so the list can be updated by replacing the file. These entries
+# are the fallback baked in so the app works without the file.
+COMPANY_MAP_RAW = {
+    "Damona & Crew": "Damona", "The Ticket Guy LLC": "TTG", "Y&S Tickets": "Y&S",
+    "YourTickets": "YourTix", "YS Asher Tickets": "Asher", "YS Chase Tickets": "Chase",
+    "YS Katz Tickets": "Katz", "YS Levine Tickets": "Levine",
+    "YS Levovitz Tickets": "Levovitz", "YS Needle Tickets": "Needle",
+    "YS TL Tickets": "TL", "YSKG Tickets": "GK", "YSM Tickets": "Grossman",
+    "YSP Tickets": "Pollak", "YSS Tickets": "Sternbuch", "YSW Tickets": "Waxler",
+}
+# TicketVault-side spellings -> Short Name (extra keys that also resolve to a company).
+COMPANY_TV_RAW = {
+    "The Ticket Guy": "TTG", "YS Tickets": "Y&S", "YSA": "Asher", "Jacks YS": "Chase",
+    "YS Katz": "Katz", "Yoni Levine": "Levine", "Needle Tickets LLC": "Needle",
+    "YS TL": "TL", "GK LLC": "GK", "Pollak Tickets": "Pollak", "YSW": "Waxler",
+    "Damon and Crew": "Damona",
+}
+
 
 # =========================================================================== #
 # Generic helpers  (reused from the ledger-reconciliation scaffold)
@@ -333,34 +353,84 @@ def _company_core(label):
     return re.sub(r"[^a-z0-9]", "", str(label).lower())
 
 
+# Words dropped when reducing a company name to its distinctive "core", so that a QBO title
+# ("YS Levine LLC") and a mapping entry ("YS Levine Tickets") reduce to the same key.
+_MAP_STOPWORDS = {"llc", "inc", "incorporated", "corp", "co", "company", "ltd", "the",
+                  "tickets", "ticket", "tix"}
+
+
+def _map_core(name):
+    norm = _norm_name(name).replace("&", "").replace("+", "")
+    toks = [t for t in re.findall(r"[a-z0-9]+", norm) if t not in _MAP_STOPWORDS]
+    return "".join(toks)
+
+
+def _load_mapping_file():
+    """Read Master_Mapping_List.xlsx if it's bundled next to app.py, returning
+    {core: short_name}. Reads the QBO-Company column and the TicketVault-Company column,
+    both mapped to the Short-Name column. Returns {} if the file isn't present."""
+    path = os.path.join(BASE_DIR, "Master_Mapping_List.xlsx")
+    out = {}
+    if not os.path.exists(path):
+        return out
+    try:
+        wb = load_workbook(path, data_only=True, read_only=True)
+        for r in wb.worksheets[0].iter_rows(values_only=True):
+            r = list(r)
+            short = str(r[1]).strip() if len(r) > 1 and r[1] and str(r[1]).strip() else None
+            if not short:
+                continue
+            for col in (0, 3):    # QBO Company, TicketVault Company
+                v = r[col] if len(r) > col else None
+                if v and str(v).strip().upper() != "N/A":
+                    core = _map_core(v)
+                    if core:
+                        out[core] = short
+        wb.close()
+    except Exception:
+        pass
+    return out
+
+
+# core -> short name, built from the baked-in tables then overridden by the bundled file
+MAP_BY_CORE = {}
+for _raw in (COMPANY_MAP_RAW, COMPANY_TV_RAW):
+    for _k, _v in _raw.items():
+        _c = _map_core(_k)
+        if _c:
+            MAP_BY_CORE[_c] = _v
+MAP_BY_CORE.update(_load_mapping_file())
+MAP_BY_CORE.pop("", None)
+
+
 def resolve_company(name):
     """Map an entity name (or filename stem, or a picked value) to one of the COMPANIES
-    roster names. Order of resolution: exact roster name → COMPANY_ALIASES → the longest
-    roster core that appears as a whole word/token in the name. Returns None if nothing
-    fits."""
+    roster names, using the master mapping list first. Order: exact roster name →
+    COMPANY_ALIASES → master-mapping core → longest roster token in the name. None if
+    nothing fits."""
     if not name:
         return None
     norm = _norm_name(name)
-    # already a roster name?
-    for c in COMPANIES:
+    for c in COMPANIES:                     # already a roster name?
         if _norm_name(c) == norm:
             return c
-    # explicit alias (exact or suffix-tolerant)
-    if norm in COMPANY_ALIASES:
+    if norm in COMPANY_ALIASES:             # explicit override
         return COMPANY_ALIASES[norm]
     skey = _strip_suffix(name)
     for k, v in COMPANY_ALIASES.items():
         if _strip_suffix(k) == skey and skey:
             return v
-    # token match — a roster core equal to one of the name's tokens; longest core wins.
-    # '&' and '+' are joined into the adjacent letters first, so "Y&S" -> token "ys".
+    core = _map_core(name)                  # master mapping list (authoritative)
+    if core in MAP_BY_CORE:
+        return MAP_BY_CORE[core]
+    # token fallback — a roster core equal to one of the name's tokens; longest core wins.
     joined = norm.replace("&", "").replace("+", "")
     tokens = set(re.findall(r"[a-z0-9]+", joined))
     best, best_len = None, 0
     for c in COMPANIES:
-        core = _company_core(c)
-        if core in tokens and len(core) > best_len:
-            best, best_len = c, len(core)
+        cc = _company_core(c)
+        if cc in tokens and len(cc) > best_len:
+            best, best_len = c, len(cc)
     return best
 
 
@@ -891,57 +961,6 @@ def build_workbook(qbo_files, tv_files, tv_companies=None):
     # ------------------------------------------------------------------ workbook
     wb = Workbook()
     wb.remove(wb.active)
-
-    # ---- Summary ----
-    ws = wb.create_sheet("Summary")
-    ws["A1"] = "QBO ↔ TicketVault Reconciliation"
-    ws["A1"].font = TITLE_FONT
-    ws["A2"] = f"Generated {dt.datetime.now():%B %d, %Y %I:%M %p}"
-    ws["A2"].font = SUB_FONT
-    r = 4
-    facts = [
-        ("Entities reconciled", len(pairs)),
-        ("QBO files", len(qbos)),
-        ("TicketVault files", len(tvs)),
-        ("Sales discrepancies", len(sales_rows)),
-        ("Cost discrepancies", len(cost_rows)),
-        ("Unpaired files", len(unpaired_q) + len(unpaired_t)),
-        ("Tolerance", f"${TOLERANCE:.2f}"),
-    ]
-    for label, val in facts:
-        ws.cell(row=r, column=1, value=label).font = LABEL_FONT
-        ws.cell(row=r, column=2, value=val).font = BASE_FONT
-        r += 1
-
-    r += 1
-    ws.cell(row=r, column=1, value="Pairing").font = LABEL_FONT
-    r += 1
-    pcols = ["Entity", "QBO File", "TicketVault File", "Period", "Sales Δ", "Cost Δ",
-             "Matched On"]
-    if pair_info:
-        r = _emit_table(ws, r, pcols, pair_info, money_cols=set())
-    else:
-        ws.cell(row=r, column=1, value="No files could be paired.").font = BASE_FONT
-        r += 1
-
-    if warnings:
-        r += 1
-        ws.cell(row=r, column=1, value="Notes").font = LABEL_FONT
-        r += 1
-        for w in warnings:
-            ws.cell(row=r, column=1, value="• " + w).font = BASE_FONT
-            r += 1
-
-    r += 1
-    ws.cell(row=r, column=1, value="Legend").font = LABEL_FONT
-    r += 1
-    for line in ("MISMATCH — both books have a value for the marketplace/day but they differ.",
-                 "QBO only / TicketVault only — the amount appears in one book but not the other.",
-                 "Sales are matched per marketplace × day; cost is matched per day "
-                 "(QBO records cost as a single daily journal)."):
-        ws.cell(row=r, column=1, value="• " + line).font = SUB_FONT
-        r += 1
-    _autofit(ws, [26, 30, 30, 20, 10, 10, 18])
 
     # ---- Sales Discrepancies ----
     ws = wb.create_sheet("Sales Discrepancies")
