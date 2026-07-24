@@ -723,7 +723,7 @@ def reconcile_pair(entity, qbook, tbook):
         elif v is None or abs(v) <= TOLERANCE:
             status = "QBO only"
         else:
-            status = "MISMATCH"
+            status = "Amount Mismatch"
         sales_rows.append({
             "Entity": entity, "Date": d, "Marketplace": names.get(mkey, mkey),
             "QBO": round(q, 2) if q is not None else 0.0,
@@ -743,7 +743,7 @@ def reconcile_pair(entity, qbook, tbook):
         elif v is None or abs(v) <= TOLERANCE:
             status = "QBO only"
         else:
-            status = "MISMATCH"
+            status = "Amount Mismatch"
         cost_rows.append({
             "Entity": entity, "Date": d,
             "QBO Cost": round(q, 2) if q is not None else 0.0,
@@ -760,7 +760,6 @@ def reconcile_pair(entity, qbook, tbook):
 
 HEAD_FILL = PatternFill("solid", fgColor="374151")
 HEAD_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-FLAG_FILL = PatternFill("solid", fgColor="FDECEC")
 TITLE_FONT = Font(name="Arial", bold=True, size=13)
 SUB_FONT = Font(name="Arial", italic=True, color="6B7280", size=9)
 LABEL_FONT = Font(name="Arial", bold=True, size=10)
@@ -792,7 +791,6 @@ def _emit_table(ws, start_row, columns, rows, money_cols, total_cols=None):
     r = start_row + 1
     first_data = r
     for rec in rows:
-        flagged = rec.get("_flag")
         for j, name in enumerate(columns, start=1):
             v = rec.get(name, "")
             if isinstance(v, dt.date):
@@ -804,8 +802,6 @@ def _emit_table(ws, start_row, columns, rows, money_cols, total_cols=None):
                 cell.number_format = MONEY
             if name in money_cols:
                 cell.alignment = Alignment(horizontal="right")
-            if flagged:
-                cell.fill = FLAG_FILL
         r += 1
     last_data = r - 1
     if total_cols and last_data >= first_data:
