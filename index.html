@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QBO ↔ TicketVault Reconciliation</title>
+<title>Daily Sales Reconciliation</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -65,10 +65,10 @@
 <body>
 <div class="card">
   <div class="card-body">
-    <div class="card-title">QBO ↔ TicketVault Reconciliation</div>
-    <div class="card-sub">Upload the QuickBooks <strong>Profit &amp; Loss Detail</strong> and the matching <strong>TicketVault</strong> export for each entity. Choose the company for each TicketVault file from the drop-down (pre-filled from the file name when it can be detected). The app flags any sales (by marketplace &amp; day) or cost (by day) that don't agree.</div>
+    <div class="card-title">Daily Sales Reconciliation</div>
+    <div class="card-sub">Upload the QBO sales and COGS ledgers along with the Daily Sales Reporting exports from TicketVault to identify discrepancies. </div>
 
-    <div class="section-label">QuickBooks P&amp;L Detail <span class="opt-tag">ONE OR MORE</span></div>
+    <div class="section-label">QBO Ledgers</div>
     <div class="dropzone" id="dzQBO" data-key="qbo">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
@@ -76,7 +76,7 @@
     </div>
     <div class="file-list" id="listQBO"></div>
 
-    <div class="section-label spaced">TicketVault Exports <span class="opt-tag">ONE OR MORE</span></div>
+    <div class="section-label spaced">TicketVault Daily Sales Reporting Exports</div>
     <div class="dropzone" id="dzTV" data-key="ticketvault">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
