@@ -1,10 +1,11 @@
 # QBO ↔ TicketVault Reconciliation
 
 Web app: upload the QuickBooks **Profit and Loss Detail** and the matching **TicketVault**
-export (`.xlsx`, `.xlsm`, or `.csv`) for each entity. Upload as many pairs as you like in
-one go — the app pairs each QBO to its TicketVault automatically. Download a lean workbook
-that flags any **sales** (by marketplace × day) or **cost** (by day) that don't agree,
-over a tolerance ($0.01 by default).
+export (`.xlsx`, `.xlsm`, or `.csv`) for each entity. Pick the company for each TicketVault
+file from a drop-down (pre-filled from the filename when possible) so the two are paired
+exactly. Upload as many pairs as you like in one go. Download a lean workbook that flags any
+**sales** (by marketplace × day) or **cost** (by day) that don't agree, over a tolerance
+($0.01 by default).
 
 Built on the same Flask + single-page-UI + Railway pattern as the Ledger Reconciliation app.
 
@@ -39,18 +40,19 @@ are shown side by side and any divergence over the tolerance is flagged.
 
 ### Pairing (batch)
 
-**TicketVault exports don't contain a company name** in their data, so the app identifies
-each one by, in order: (1) a **title row** inside the file, if the export has one; (2) the
-**filename** (e.g. `YS_Levine_July.csv`); each is matched to a QBO entity — exact, then
-suffix-tolerant *LLC/Inc*, then the `ENTITY_ALIASES` table. Only if neither yields a name
-does it fall back to **period** overlap and **total-sales proximity**.
+Each TicketVault file is assigned to a QBO entity by a **company drop-down** in the upload
+list. The drop-down is filled with the entities read from the QBO files you upload (via
+`/qbo_entities`), and each file's selection is **pre-filled from its filename** when that
+matches an entity (and auto-set when there's only one QBO entity). Whatever is selected is
+**authoritative** — it's how the app knows which TicketVault belongs to which company, even
+when the filename gives nothing away. The Reconcile button stays disabled until every
+TicketVault file has a company chosen.
 
-That fallback is a guess, and — because a genuinely discrepant book won't tie out — it can
-mispair. So when a batch pair is made without a confirmed company name, it's called out in
-the Summary **Notes** ("paired by period/amount only — verify"). **The reliable way to run
-multiple companies at once is to put the company in each TicketVault filename** (and add an
-`ENTITY_ALIASES` entry if the spelling differs from QBO). Every pairing and the basis it
-matched on is shown on the **Summary** tab; unpaired files are listed there too.
+If a file is left without a selection (e.g. via the API), the app falls back to reading a
+company name from inside the file, then the filename, then period overlap and total-sales
+proximity — and flags any such guess in the Summary **Notes** so you can verify it. Every
+pairing and the basis it matched on is shown on the **Summary** tab; unpaired files (and
+selections that match no QBO) are listed there too.
 
 ### Output tabs (lean)
 

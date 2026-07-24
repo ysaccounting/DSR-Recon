@@ -674,8 +674,26 @@ def _emit_table(ws, start_row, columns, rows, money_cols, total_cols=None):
     return r
 
 
-def build_workbook(qbo_files, tv_files):
-    """qbo_files / tv_files: lists of (filename, bytes)."""
+def _qbo_label(entity, filename):
+    """The label shown for a QBO file in the company dropdown: its detected entity, or the
+    filename stem when the entity can't be read."""
+    return entity or os.path.splitext(os.path.basename(filename))[0]
+
+
+def detect_qbo_entity(filename, data):
+    """Light read of just the entity name from a QBO file's title row (for /qbo_entities).
+    Returns the label the dropdown should show."""
+    try:
+        rows = _rows_from_upload(filename, data)
+    except Exception:
+        return _qbo_label(None, filename)
+    return _qbo_label(_canon_entity(_detect_entity(rows)), filename)
+
+
+def build_workbook(qbo_files, tv_files, tv_companies=None):
+    """qbo_files / tv_files: lists of (filename, bytes). tv_companies: optional list, one
+    entry per TicketVault file, of the entity the user picked in the dropdown (authoritative
+    when present)."""
     qbos, tvs, warnings = [], [], []
 
     for fn, data in qbo_files:
@@ -685,22 +703,61 @@ def build_workbook(qbo_files, tv_files):
                             f"title row — pairing will rely on period / totals.")
         qbos.append((entity, book, meta))
 
+    qlabels = [_qbo_label(q[0], q[2]["filename"]) for q in qbos]
     known_entities = [q[0] for q in qbos if q[0]]
-    for fn, data in tv_files:
+    tv_companies = tv_companies or []
+    for i, (fn, data) in enumerate(tv_files):
         book, meta = parse_ticketvault(fn, data)
-        # 1) company name read from inside the file, if any; else 2) a filename token,
-        # matched against the known QBO entities (exact / suffix / alias).
-        ent = meta.get("entity")
-        if not ent:
-            stem = os.path.splitext(os.path.basename(fn))[0].replace("_", " ")
-            for kent in known_entities:
-                if _entities_match(stem, kent):
-                    ent = kent
-                    break
-        meta["entity"] = ent
-        tvs.append((book, meta, ent))
+        selected = (tv_companies[i] if i < len(tv_companies) else "") or ""
+        selected = selected.strip()
+        if selected:
+            # dropdown pick — authoritative.
+            meta["entity"] = _canon_entity(selected)
+            meta["selected"] = True
+        else:
+            # 1) company name read from inside the file, if any; else 2) a filename token,
+            # matched against the known QBO entities (exact / suffix / alias).
+            ent = meta.get("entity")
+            if not ent:
+                stem = os.path.splitext(os.path.basename(fn))[0].replace("_", " ")
+                for kent in known_entities:
+                    if _entities_match(stem, kent):
+                        ent = kent
+                        break
+            meta["entity"] = ent
+            meta["selected"] = False
+        tvs.append((book, meta, meta["entity"]))
 
-    pairs, unpaired_q, unpaired_t, basis = pair_files(qbos, tvs)
+    # ---- pairing: honor explicit dropdown selections first, auto-pair the rest ----
+    used_q, used_t, pairs, basis = set(), set(), [], {}
+    for ti, (tbook, tmeta, tent) in enumerate(tvs):
+        if not tmeta.get("selected"):
+            continue
+        sel = tmeta["entity"]
+        match_qi = next((qi for qi in range(len(qbos))
+                         if qi not in used_q and
+                         (_norm_name(qlabels[qi]) == _norm_name(sel)
+                          or _entities_match(qlabels[qi], sel))), None)
+        if match_qi is None:
+            warnings.append(f"TicketVault '{tmeta['filename']}' is assigned to '{sel}', "
+                            f"which doesn't match any uploaded QBO file — not reconciled.")
+            used_t.add(ti)
+            continue
+        used_q.add(match_qi)
+        used_t.add(ti)
+        pairs.append((match_qi, ti))
+        basis[(match_qi, ti)] = "company (selected)"
+
+    rem_q = [qi for qi in range(len(qbos)) if qi not in used_q]
+    rem_t = [ti for ti in range(len(tvs)) if ti not in used_t]
+    gpairs, gup_q, gup_t, gbasis = pair_files([qbos[i] for i in rem_q],
+                                              [tvs[i] for i in rem_t])
+    for (lqi, lti) in gpairs:
+        gqi, gti = rem_q[lqi], rem_t[lti]
+        pairs.append((gqi, gti))
+        basis[(gqi, gti)] = gbasis[(lqi, lti)]
+    unpaired_q = [rem_q[i] for i in gup_q]
+    unpaired_t = [rem_t[i] for i in gup_t]
 
     sales_rows, cost_rows, pair_info = [], [], []
     for qi, ti in pairs:
@@ -720,9 +777,10 @@ def build_workbook(qbo_files, tv_files):
             "Matched On": pair_basis,
             "_flag": bool(s or c),
         })
-        # In a batch, a pair matched only by period/amount (no confirmed company name) is
-        # a guess — surface it so the user can verify or add an alias.
-        if (len(qbos) > 1 or len(tvs) > 1) and "entity" not in pair_basis:
+        # In a batch, a pair matched only by period/amount (no confirmed company name and
+        # no dropdown selection) is a guess — surface it so the user can verify.
+        if (len(qbos) > 1 or len(tvs) > 1) and "entity" not in pair_basis \
+                and "selected" not in pair_basis:
             warnings.append(
                 f"TicketVault '{tmeta['filename']}' was paired to '{entity}' by "
                 f"period/amount only — no company name was found in the file or its "
@@ -847,19 +905,35 @@ def index():
     return send_from_directory(BASE_DIR, "index.html")
 
 
+@app.route("/qbo_entities", methods=["POST"])
+def qbo_entities():
+    """Return the entity/company names detected from the uploaded QBO files, to fill the
+    TicketVault company dropdown. Order preserved; duplicates removed."""
+    entities, files = [], []
+    for f in request.files.getlist("qbo"):
+        if not f.filename:
+            continue
+        label = detect_qbo_entity(f.filename, f.read())
+        files.append({"filename": f.filename, "label": label})
+        if label and label not in entities:
+            entities.append(label)
+    return jsonify({"entities": entities, "files": files})
+
+
 @app.route("/process", methods=["POST"])
 def process():
     qbo_files = [(f.filename, f.read())
                  for f in request.files.getlist("qbo") if f.filename]
     tv_files = [(f.filename, f.read())
                 for f in request.files.getlist("ticketvault") if f.filename]
+    tv_companies = request.form.getlist("ticketvault_company")
     if not qbo_files:
         return jsonify({"error": "Please upload at least one QuickBooks P&L Detail."}), 400
     if not tv_files:
         return jsonify({"error": "Please upload at least one TicketVault export."}), 400
 
     try:
-        data, meta = build_workbook(qbo_files, tv_files)
+        data, meta = build_workbook(qbo_files, tv_files, tv_companies)
     except Exception as exc:
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
@@ -876,7 +950,7 @@ def process():
         warnings.append(f"{meta['sales_flags']} sales discrepancy row(s) flagged.")
     if meta["cost_flags"]:
         warnings.append(f"{meta['cost_flags']} cost discrepancy row(s) flagged.")
-    if not meta["sales_flags"] and not meta["cost_flags"]:
+    if not meta["sales_flags"] and not meta["cost_flags"] and meta["entities"]:
         warnings.append("Everything reconciled within tolerance — no discrepancies.")
     warnings.extend(meta["warnings"])
 

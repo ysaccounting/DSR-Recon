@@ -28,13 +28,18 @@
   .dropzone-text a { color: #4B6FBE; text-decoration: none; }
   .dropzone-text a:hover { text-decoration: underline; }
   .dropzone-hint { font-size: .78rem; color: #9CA3AF; margin-top: .25rem; }
-  .file-list { display: flex; flex-direction: column; gap: .35rem; margin-top: .6rem; }
-  .file-pill { display: flex; align-items: center; gap: .6rem; background: #F3F4F6; border-radius: 7px;
-    padding: .4rem .7rem; font-size: .8rem; color: #374151; }
-  .file-pill .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file-pill .remove { margin-left: auto; cursor: pointer; color: #9CA3AF; background: none; border: none;
-    font-size: 1rem; line-height: 1; padding: 0 2px; }
-  .file-pill .remove:hover { color: #374151; }
+  .file-list { display: flex; flex-direction: column; gap: .45rem; margin-top: .6rem; }
+  .file-row { display: flex; align-items: center; gap: .5rem; background: #F3F4F6; border-radius: 8px;
+    padding: .45rem .6rem; font-size: .8rem; color: #374151; flex-wrap: wrap; }
+  .file-row .fname { flex: 1 1 170px; min-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-row select { font-family: inherit; font-size: .76rem; color: #111; background: #fff;
+    border: 1px solid #D1D5DB; border-radius: 6px; padding: .3rem .4rem; cursor: pointer; max-width: 200px; }
+  .file-row select.need { border-color: #E2A8A8; background: #FFF7F7; }
+  .file-row select:focus { outline: none; border-color: #7B8DB0; }
+  .file-row select:disabled { background: #F1F2F5; color: #9AA0AC; cursor: not-allowed; }
+  .file-row .remove { cursor: pointer; color: #9CA3AF; background: none; border: none; font-size: 1rem;
+    line-height: 1; padding: 0 2px; }
+  .file-row .remove:hover { color: #374151; }
   .actions { display: flex; gap: .75rem; margin-top: 1.5rem; }
   .btn-process { flex: 1; background: #4B5563; color: #fff; border: none; border-radius: 8px; padding: .7rem 1.25rem;
     font-family: inherit; font-weight: 600; font-size: .9rem; cursor: pointer; display: flex; align-items: center;
@@ -66,13 +71,13 @@
 <div class="card">
   <div class="card-body">
     <div class="card-title">QBO ↔ TicketVault Reconciliation</div>
-    <div class="card-sub">Upload the QuickBooks <strong>Profit &amp; Loss Detail</strong> and the matching <strong>TicketVault</strong> export for each entity. The app pairs them up, then flags any sales (by marketplace &amp; day) or cost (by day) that don't agree.</div>
+    <div class="card-sub">Upload the QuickBooks <strong>Profit &amp; Loss Detail</strong> and the matching <strong>TicketVault</strong> export for each entity. Choose the company for each TicketVault file from the drop-down (pre-filled from the file name when it can be detected). The app flags any sales (by marketplace &amp; day) or cost (by day) that don't agree.</div>
 
     <div class="section-label">QuickBooks P&amp;L Detail <span class="opt-tag">ONE OR MORE</span></div>
     <div class="dropzone" id="dzQBO" data-key="qbo">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
-      <div class="dropzone-hint">Accepts .xlsx / .xlsm / .csv</div>
+      <div class="dropzone-hint">Accepts .xlsx / .xlsm / .csv &middot; the entity is read from each file</div>
     </div>
     <div class="file-list" id="listQBO"></div>
 
@@ -80,7 +85,7 @@
     <div class="dropzone" id="dzTV" data-key="ticketvault">
       <input type="file" accept=".csv,.xlsx,.xlsm" multiple>
       <div class="dropzone-text">Drag &amp; drop or <a href="#" class="browse">browse</a></div>
-      <div class="dropzone-hint">Accepts .xlsx / .xlsm / .csv</div>
+      <div class="dropzone-hint">Choose the company per file &middot; .csv / .xlsx / .xlsm</div>
     </div>
     <div class="file-list" id="listTV"></div>
 
@@ -97,7 +102,9 @@
 
 <script>
   const KEYS = { qbo: 'QBO', ticketvault: 'TV' };
+  // qbo entries are plain File objects; ticketvault entries are { file, company }.
   const store = { qbo: [], ticketvault: [] };
+  let ENTITIES = [];          // company/entity names detected from the QBO files
   const processBtn = document.getElementById('processBtn');
   const btnLabel = document.getElementById('btnLabel');
   const spinner = document.getElementById('spinner');
@@ -116,43 +123,113 @@
     dz.querySelector('.browse').addEventListener('click', e => { e.preventDefault(); input.click(); });
   }
 
+  // best-guess the company from the file name against the detected QBO entities
+  function guessCompany(name) {
+    if (ENTITIES.length === 1) return ENTITIES[0];
+    const n = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (const c of ENTITIES) {
+      const key = c.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const bare = c.toLowerCase().replace(/\b(llc|inc|incorporated|corp|co|company|ltd)\b/g, '').replace(/[^a-z0-9]/g, '');
+      if ((key && n.includes(key)) || (bare && bare.length > 2 && n.includes(bare))) return c;
+    }
+    return '';
+  }
+
   function add(key, fileList) {
     const files = [...fileList].filter(f => /\.(csv|xlsx|xlsm)$/i.test(f.name));
-    // accumulate many files per slot; skip exact duplicates
     files.forEach(f => {
-      if (!store[key].some(x => x.name === f.name && x.size === f.size)) store[key].push(f);
+      if (key === 'qbo') {
+        if (!store.qbo.some(x => x.name === f.name && x.size === f.size)) store.qbo.push(f);
+      } else {
+        if (!store.ticketvault.some(x => x.file.name === f.name && x.file.size === f.size))
+          store.ticketvault.push({ file: f, company: guessCompany(f.name) });
+      }
     });
+    if (key === 'qbo') refreshEntities();
     render(key);
+  }
+
+  // ask the backend which entities the QBO files contain, then fill the dropdowns
+  async function refreshEntities() {
+    if (!store.qbo.length) { ENTITIES = []; render('ticketvault'); return; }
+    const fd = new FormData();
+    store.qbo.forEach(f => fd.append('qbo', f));
+    try {
+      const resp = await fetch('/qbo_entities', { method: 'POST', body: fd });
+      const d = await resp.json();
+      ENTITIES = d.entities || [];
+    } catch (err) { ENTITIES = []; }
+    // pre-fill any TicketVault file that doesn't yet have a valid company
+    store.ticketvault.forEach(e => {
+      if (!e.company || !ENTITIES.includes(e.company)) e.company = guessCompany(e.file.name);
+    });
+    render('ticketvault');
+  }
+
+  function selectHTML(selected) {
+    let html = `<select class="sel-co${selected ? '' : ' need'}"${ENTITIES.length ? '' : ' disabled'}>`;
+    const placeholder = ENTITIES.length ? 'Company…' : 'Add a QBO file first…';
+    html += `<option value="" ${selected ? '' : 'selected'} disabled>${placeholder}</option>`;
+    ENTITIES.forEach(o => {
+      const sel = o === selected ? 'selected' : '';
+      html += `<option value="${o.replace(/"/g, '&quot;')}" ${sel}>${o}</option>`;
+    });
+    return html + `</select>`;
   }
 
   function render(key) {
     const list = listEl(key);
     list.innerHTML = '';
-    store[key].forEach((f, idx) => {
-      const pill = document.createElement('div');
-      pill.className = 'file-pill';
-      pill.innerHTML = `<span class="fname">${f.name}</span><button class="remove" title="Remove">&times;</button>`;
-      pill.querySelector('.remove').addEventListener('click', () => { store[key].splice(idx, 1); render(key); });
-      list.appendChild(pill);
-    });
-    processBtn.disabled = store.qbo.length === 0 || store.ticketvault.length === 0;
+    if (key === 'qbo') {
+      store.qbo.forEach((f, i) => {
+        const row = document.createElement('div');
+        row.className = 'file-row';
+        row.innerHTML = `<span class="fname" title="${f.name}">${f.name}</span><button class="remove" title="Remove">&times;</button>`;
+        row.querySelector('.remove').addEventListener('click', () => {
+          store.qbo.splice(i, 1); refreshEntities(); render('qbo');
+        });
+        list.appendChild(row);
+      });
+    } else {
+      store.ticketvault.forEach((entry, i) => {
+        const row = document.createElement('div');
+        row.className = 'file-row';
+        row.innerHTML = `<span class="fname" title="${entry.file.name}">${entry.file.name}</span>${selectHTML(entry.company)}<button class="remove" title="Remove">&times;</button>`;
+        const sel = row.querySelector('.sel-co');
+        sel.addEventListener('change', e => {
+          entry.company = e.target.value; e.target.classList.toggle('need', !entry.company); updateBtn();
+        });
+        row.querySelector('.remove').addEventListener('click', () => { store.ticketvault.splice(i, 1); render('ticketvault'); });
+        list.appendChild(row);
+      });
+    }
+    updateBtn();
   }
+
+  function ready() {
+    if (!store.qbo.length || !store.ticketvault.length) return false;
+    // if we know the entities, every TicketVault file must be assigned one
+    if (ENTITIES.length && store.ticketvault.some(e => !e.company)) return false;
+    return true;
+  }
+  function updateBtn() { processBtn.disabled = !ready(); }
 
   Object.keys(store).forEach(setup);
 
   document.getElementById('clearBtn').addEventListener('click', () => {
-    Object.keys(store).forEach(k => { store[k] = []; render(k); });
+    store.qbo = []; store.ticketvault = []; ENTITIES = [];
+    render('qbo'); render('ticketvault');
     resultsDiv.style.display = 'none'; resultsDiv.innerHTML = '';
   });
 
   processBtn.addEventListener('click', async () => {
-    if (!store.qbo.length || !store.ticketvault.length) return;
+    if (!ready()) return;
     processBtn.disabled = true; btnLabel.textContent = 'Reconciling…'; spinner.style.display = 'block';
     resultsDiv.style.display = 'none'; resultsDiv.innerHTML = '';
 
     const fd = new FormData();
     store.qbo.forEach(f => fd.append('qbo', f));
-    store.ticketvault.forEach(f => fd.append('ticketvault', f));
+    store.ticketvault.forEach(e => { fd.append('ticketvault', e.file); fd.append('ticketvault_company', e.company || ''); });
 
     try {
       const resp = await fetch('/process', { method: 'POST', body: fd });
@@ -175,8 +252,7 @@
       resultsDiv.innerHTML = `<div class="error-item"><p><strong>Network error:</strong> ${err.message}</p></div>`;
       resultsDiv.style.display = 'block';
     } finally {
-      processBtn.disabled = store.qbo.length === 0 || store.ticketvault.length === 0;
-      btnLabel.textContent = 'Reconcile'; spinner.style.display = 'none';
+      updateBtn(); btnLabel.textContent = 'Reconcile'; spinner.style.display = 'none';
     }
   });
 </script>
