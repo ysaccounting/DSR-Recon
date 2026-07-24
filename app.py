@@ -86,6 +86,20 @@ ENTITY_ALIASES = {
     # "ys levine tickets": "YS Levine LLC",
 }
 
+# The company roster shown in the TicketVault drop-down — names and order exactly as in the
+# Season Ticket Buy-In Review app. Each TicketVault file is tagged with one of these; the
+# app maps it to the QBO file whose entity resolves to the same company.
+COMPANIES = ["Y&S", "Grossman", "Sternbuch", "Pollak", "Levine", "Levovitz",
+             "Chase", "Asher", "Katz", "GK", "TL", "Waxler", "TTG", "YourTix"]
+
+# Force a QBO entity (or a stray spelling) onto a specific roster company when the automatic
+# token match is wrong or missing. Key = entity text (normalized); value = a COMPANIES name.
+# e.g. a QBO titled "YS Levine LLC" already resolves to "Levine" automatically; add an entry
+# here only for names the matcher can't place.
+COMPANY_ALIASES = {
+    # "some holdings llc": "TTG",
+}
+
 
 # =========================================================================== #
 # Generic helpers  (reused from the ledger-reconciliation scaffold)
@@ -313,9 +327,66 @@ def _entities_match(a, b):
     return bool(_strip_suffix(ca)) and _strip_suffix(ca) == _strip_suffix(cb)
 
 
+def _company_core(label):
+    """Normalized single-token core of a roster company ('Y&S' -> 'ys', 'YourTix' ->
+    'yourtix')."""
+    return re.sub(r"[^a-z0-9]", "", str(label).lower())
+
+
+def resolve_company(name):
+    """Map an entity name (or filename stem, or a picked value) to one of the COMPANIES
+    roster names. Order of resolution: exact roster name → COMPANY_ALIASES → the longest
+    roster core that appears as a whole word/token in the name. Returns None if nothing
+    fits."""
+    if not name:
+        return None
+    norm = _norm_name(name)
+    # already a roster name?
+    for c in COMPANIES:
+        if _norm_name(c) == norm:
+            return c
+    # explicit alias (exact or suffix-tolerant)
+    if norm in COMPANY_ALIASES:
+        return COMPANY_ALIASES[norm]
+    skey = _strip_suffix(name)
+    for k, v in COMPANY_ALIASES.items():
+        if _strip_suffix(k) == skey and skey:
+            return v
+    # token match — a roster core equal to one of the name's tokens; longest core wins.
+    # '&' and '+' are joined into the adjacent letters first, so "Y&S" -> token "ys".
+    joined = norm.replace("&", "").replace("+", "")
+    tokens = set(re.findall(r"[a-z0-9]+", joined))
+    best, best_len = None, 0
+    for c in COMPANIES:
+        core = _company_core(c)
+        if core in tokens and len(core) > best_len:
+            best, best_len = c, len(core)
+    return best
+
+
 # =========================================================================== #
 # Parsers
 # =========================================================================== #
+
+def _looks_like_qbo(rows):
+    """Heuristic: does this look like a QuickBooks P&L/Detail rather than a TicketVault
+    export? (Has a 'Profit and Loss' title, or a Date/Amount/Balance header.)"""
+    for row in rows[:8]:
+        for c in row:
+            if isinstance(c, str) and "profit and loss" in c.lower():
+                return True
+    hi, _ = _find_header(rows, ["amount", "balance"])
+    return hi is not None
+
+
+def _looks_like_ticketvault(rows):
+    """Heuristic: does this look like a TicketVault export? (Has a Client + Sold header.)"""
+    for row in rows[:12]:
+        cells = [(_norm_name(c) if c is not None else "") for c in row]
+        if "client" in cells and "sold" in cells:
+            return True
+    return False
+
 
 def parse_qbo(filename, data):
     """QuickBooks 'Profit and Loss Detail' -> per-entity book.
@@ -331,6 +402,9 @@ def parse_qbo(filename, data):
     rows = _rows_with_indent(filename, data)
     hi, _ = _find_header(rows, ["date", "amount", "balance"])
     if hi is None:
+        if _looks_like_ticketvault(rows):
+            raise ValueError(f"'{filename}' looks like a TicketVault export, not a "
+                             f"QuickBooks P&L Detail — put it in the TicketVault box.")
         raise ValueError(f"QBO '{filename}': could not find a header row with "
                          f"'Date', 'Amount' and 'Balance'.")
     hdr = [(_norm_name(c) if c is not None else "") for c in rows[hi]]
@@ -435,6 +509,10 @@ def parse_ticketvault(filename, data):
             hdr = cells
             break
     if hi is None:
+        if _looks_like_qbo(rows):
+            raise ValueError(f"'{filename}' looks like a QuickBooks P&L Detail, not a "
+                             f"TicketVault export. Put your TicketVault export in this box "
+                             f"(and P&L files go in the QuickBooks box above).")
         raise ValueError(f"TicketVault '{filename}': could not find the "
                          f"'Date / Client / Sold …' header row.")
 
@@ -704,6 +782,7 @@ def build_workbook(qbo_files, tv_files, tv_companies=None):
         qbos.append((entity, book, meta))
 
     qlabels = [_qbo_label(q[0], q[2]["filename"]) for q in qbos]
+    qcompanies = [resolve_company(q[0]) or resolve_company(q[2]["filename"]) for q in qbos]
     known_entities = [q[0] for q in qbos if q[0]]
     tv_companies = tv_companies or []
     for i, (fn, data) in enumerate(tv_files):
@@ -711,12 +790,12 @@ def build_workbook(qbo_files, tv_files, tv_companies=None):
         selected = (tv_companies[i] if i < len(tv_companies) else "") or ""
         selected = selected.strip()
         if selected:
-            # dropdown pick — authoritative.
-            meta["entity"] = _canon_entity(selected)
+            # dropdown pick — a roster company, authoritative.
+            meta["company"] = resolve_company(selected) or selected
+            meta["entity"] = meta["company"]
             meta["selected"] = True
         else:
-            # 1) company name read from inside the file, if any; else 2) a filename token,
-            # matched against the known QBO entities (exact / suffix / alias).
+            # 1) company name read from inside the file, if any; else 2) a filename token.
             ent = meta.get("entity")
             if not ent:
                 stem = os.path.splitext(os.path.basename(fn))[0].replace("_", " ")
@@ -725,6 +804,7 @@ def build_workbook(qbo_files, tv_files, tv_companies=None):
                         ent = kent
                         break
             meta["entity"] = ent
+            meta["company"] = resolve_company(ent) or resolve_company(fn)
             meta["selected"] = False
         tvs.append((book, meta, meta["entity"]))
 
@@ -733,11 +813,16 @@ def build_workbook(qbo_files, tv_files, tv_companies=None):
     for ti, (tbook, tmeta, tent) in enumerate(tvs):
         if not tmeta.get("selected"):
             continue
-        sel = tmeta["entity"]
-        match_qi = next((qi for qi in range(len(qbos))
-                         if qi not in used_q and
-                         (_norm_name(qlabels[qi]) == _norm_name(sel)
-                          or _entities_match(qlabels[qi], sel))), None)
+        sel = tmeta["entity"]                       # a roster company name
+        sel_co = tmeta.get("company") or sel
+        # match to the QBO whose entity resolves to the same roster company (then fall back
+        # to a direct name / suffix match).
+        match_qi = next(
+            (qi for qi in range(len(qbos))
+             if qi not in used_q and
+             ((qcompanies[qi] and _norm_name(qcompanies[qi]) == _norm_name(sel_co))
+              or _norm_name(qlabels[qi]) == _norm_name(sel)
+              or _entities_match(qlabels[qi], sel))), None)
         if match_qi is None:
             warnings.append(f"TicketVault '{tmeta['filename']}' is assigned to '{sel}', "
                             f"which doesn't match any uploaded QBO file — not reconciled.")
@@ -763,7 +848,8 @@ def build_workbook(qbo_files, tv_files, tv_companies=None):
     for qi, ti in pairs:
         qent, qbook, qmeta = qbos[qi]
         tbook, tmeta, _ = tvs[ti]
-        entity = qent or tmeta.get("entity") or f"(entity {qi + 1})"
+        entity = (qcompanies[qi] or tmeta.get("company")
+                  or qent or tmeta.get("entity") or f"(entity {qi + 1})")
         s, c = reconcile_pair(entity, qbook, tbook)
         sales_rows.extend(s)
         cost_rows.extend(c)
@@ -905,19 +991,10 @@ def index():
     return send_from_directory(BASE_DIR, "index.html")
 
 
-@app.route("/qbo_entities", methods=["POST"])
-def qbo_entities():
-    """Return the entity/company names detected from the uploaded QBO files, to fill the
-    TicketVault company dropdown. Order preserved; duplicates removed."""
-    entities, files = [], []
-    for f in request.files.getlist("qbo"):
-        if not f.filename:
-            continue
-        label = detect_qbo_entity(f.filename, f.read())
-        files.append({"filename": f.filename, "label": label})
-        if label and label not in entities:
-            entities.append(label)
-    return jsonify({"entities": entities, "files": files})
+@app.route("/options")
+def options():
+    """The company roster for the TicketVault drop-down — names and order from config."""
+    return jsonify({"companies": COMPANIES})
 
 
 @app.route("/process", methods=["POST"])
@@ -934,6 +1011,8 @@ def process():
 
     try:
         data, meta = build_workbook(qbo_files, tv_files, tv_companies)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 

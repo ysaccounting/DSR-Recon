@@ -104,11 +104,18 @@
   const KEYS = { qbo: 'QBO', ticketvault: 'TV' };
   // qbo entries are plain File objects; ticketvault entries are { file, company }.
   const store = { qbo: [], ticketvault: [] };
-  let ENTITIES = [];          // company/entity names detected from the QBO files
+  // Fixed company roster for the TicketVault drop-down — names and order match the
+  // Season Ticket Buy-In Review app. /options can override it server-side.
+  let COMPANIES = ["Y&S", "Grossman", "Sternbuch", "Pollak", "Levine", "Levovitz",
+                   "Chase", "Asher", "Katz", "GK", "TL", "Waxler", "TTG", "YourTix"];
   const processBtn = document.getElementById('processBtn');
   const btnLabel = document.getElementById('btnLabel');
   const spinner = document.getElementById('spinner');
   const resultsDiv = document.getElementById('results');
+
+  fetch('/options').then(r => r.json()).then(d => {
+    if (d.companies && d.companies.length) { COMPANIES = d.companies; render('ticketvault'); }
+  }).catch(() => {});
 
   function listEl(key) { return document.getElementById('list' + KEYS[key]); }
   function dzId(key) { return 'dz' + KEYS[key]; }
@@ -123,14 +130,12 @@
     dz.querySelector('.browse').addEventListener('click', e => { e.preventDefault(); input.click(); });
   }
 
-  // best-guess the company from the file name against the detected QBO entities
+  // best-guess the company from the file name against the roster (levine.csv -> Levine)
   function guessCompany(name) {
-    if (ENTITIES.length === 1) return ENTITIES[0];
     const n = name.toLowerCase().replace(/[^a-z0-9]/g, '');
-    for (const c of ENTITIES) {
+    for (const c of COMPANIES) {
       const key = c.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const bare = c.toLowerCase().replace(/\b(llc|inc|incorporated|corp|co|company|ltd)\b/g, '').replace(/[^a-z0-9]/g, '');
-      if ((key && n.includes(key)) || (bare && bare.length > 2 && n.includes(bare))) return c;
+      if (key && n.includes(key)) return c;
     }
     return '';
   }
@@ -145,32 +150,13 @@
           store.ticketvault.push({ file: f, company: guessCompany(f.name) });
       }
     });
-    if (key === 'qbo') refreshEntities();
     render(key);
   }
 
-  // ask the backend which entities the QBO files contain, then fill the dropdowns
-  async function refreshEntities() {
-    if (!store.qbo.length) { ENTITIES = []; render('ticketvault'); return; }
-    const fd = new FormData();
-    store.qbo.forEach(f => fd.append('qbo', f));
-    try {
-      const resp = await fetch('/qbo_entities', { method: 'POST', body: fd });
-      const d = await resp.json();
-      ENTITIES = d.entities || [];
-    } catch (err) { ENTITIES = []; }
-    // pre-fill any TicketVault file that doesn't yet have a valid company
-    store.ticketvault.forEach(e => {
-      if (!e.company || !ENTITIES.includes(e.company)) e.company = guessCompany(e.file.name);
-    });
-    render('ticketvault');
-  }
-
   function selectHTML(selected) {
-    let html = `<select class="sel-co${selected ? '' : ' need'}"${ENTITIES.length ? '' : ' disabled'}>`;
-    const placeholder = ENTITIES.length ? 'Company…' : 'Add a QBO file first…';
-    html += `<option value="" ${selected ? '' : 'selected'} disabled>${placeholder}</option>`;
-    ENTITIES.forEach(o => {
+    let html = `<select class="sel-co${selected ? '' : ' need'}">`;
+    html += `<option value="" ${selected ? '' : 'selected'} disabled>Company…</option>`;
+    COMPANIES.forEach(o => {
       const sel = o === selected ? 'selected' : '';
       html += `<option value="${o.replace(/"/g, '&quot;')}" ${sel}>${o}</option>`;
     });
@@ -185,9 +171,7 @@
         const row = document.createElement('div');
         row.className = 'file-row';
         row.innerHTML = `<span class="fname" title="${f.name}">${f.name}</span><button class="remove" title="Remove">&times;</button>`;
-        row.querySelector('.remove').addEventListener('click', () => {
-          store.qbo.splice(i, 1); refreshEntities(); render('qbo');
-        });
+        row.querySelector('.remove').addEventListener('click', () => { store.qbo.splice(i, 1); render('qbo'); });
         list.appendChild(row);
       });
     } else {
@@ -208,8 +192,7 @@
 
   function ready() {
     if (!store.qbo.length || !store.ticketvault.length) return false;
-    // if we know the entities, every TicketVault file must be assigned one
-    if (ENTITIES.length && store.ticketvault.some(e => !e.company)) return false;
+    if (store.ticketvault.some(e => !e.company)) return false;   // every file needs a company
     return true;
   }
   function updateBtn() { processBtn.disabled = !ready(); }
@@ -217,7 +200,7 @@
   Object.keys(store).forEach(setup);
 
   document.getElementById('clearBtn').addEventListener('click', () => {
-    store.qbo = []; store.ticketvault = []; ENTITIES = [];
+    store.qbo = []; store.ticketvault = [];
     render('qbo'); render('ticketvault');
     resultsDiv.style.display = 'none'; resultsDiv.innerHTML = '';
   });
