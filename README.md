@@ -40,19 +40,19 @@ are shown side by side and any divergence over the tolerance is flagged.
 
 ### Pairing (batch)
 
-Each TicketVault file is assigned to a QBO entity by a **company drop-down** in the upload
-list. The drop-down is filled with the entities read from the QBO files you upload (via
-`/qbo_entities`), and each file's selection is **pre-filled from its filename** when that
-matches an entity (and auto-set when there's only one QBO entity). Whatever is selected is
-**authoritative** — it's how the app knows which TicketVault belongs to which company, even
-when the filename gives nothing away. The Reconcile button stays disabled until every
-TicketVault file has a company chosen.
+Each TicketVault file is assigned to a company by a **drop-down** in the upload list. The
+drop-down shows a **fixed company roster** — the same names and order as the Season Ticket
+Buy-In Review app (`Y&S, Grossman, Sternbuch, Pollak, Levine, Levovitz, Chase, Asher, Katz,
+GK, TL, Waxler, TTG, YourTix`), served by `/options` so it can be edited in one place. Each
+file's pick is **pre-filled from its filename** when that matches a roster name. Whatever is
+selected is **authoritative**.
 
-If a file is left without a selection (e.g. via the API), the app falls back to reading a
-company name from inside the file, then the filename, then period overlap and total-sales
-proximity — and flags any such guess in the Summary **Notes** so you can verify it. Every
-pairing and the basis it matched on is shown on the **Summary** tab; unpaired files (and
-selections that match no QBO) are listed there too.
+Internally the app resolves each uploaded QBO file's entity to a roster company (e.g. a QBO
+titled *YS Levine LLC* resolves to **Levine**) and pairs the TicketVault file to the QBO
+with the same company. The Reconcile button stays disabled until every TicketVault file has
+a company chosen. If a pick has no matching QBO file, it's flagged in the Summary **Notes**;
+if a file is left unassigned (e.g. via the API), the app falls back to reading the company
+from the file, then the filename, then period/total proximity, and flags any such guess.
 
 ### Output tabs (lean)
 
@@ -69,6 +69,11 @@ If a tab has nothing to show, it says so instead of listing rows.
 Edit the config block at the top of `app.py`:
 
 - `TOLERANCE` — dollar threshold for "equal" (default `0.01`).
+- `COMPANIES` — the roster shown in the TicketVault drop-down (names **and order**). Served
+  to the page by `/options`.
+- `COMPANY_ALIASES` — force a QBO entity onto a specific roster company when the automatic
+  token match is wrong or missing (most names, like *YS Levine LLC → Levine*, resolve on
+  their own). Add an entry if a company's QBO title doesn't contain its roster name.
 - `MARKETPLACE_ALIASES` — force a marketplace spelled differently across the two systems
   to be treated as one (the common names already match once `(C)` is stripped).
 - `NON_MARKETPLACE_CLIENTS` — TicketVault client rows that aren't QBO sales marketplaces
