@@ -503,7 +503,9 @@ def parse_qbo(filename, data):
                 section = None
             elif low == "sales":
                 section = "sales"
-            elif low == "cost of goods sold" and depth >= 2:
+            elif low == "cost of goods sold":
+                # the COGS account holds one journal entry per day. QBO exports vary in
+                # whether the account tree is indented, so match by name, not by depth.
                 section = "cost"
             else:
                 # any other node / parent header — including "Foreign Exchange
